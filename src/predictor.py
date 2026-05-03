@@ -38,7 +38,7 @@ TRAIN_SPLIT = 0.8  # 80 % train, 20 % test
 # Feature engineering
 # ---------------------------------------------------------------------------
 
-def _add_features(df: pd.DataFrame) -> pd.DataFrame:
+def _add_features(df: pd.DataFrame, horizon: int = 1) -> pd.DataFrame:
     df = df.sort_values("date").copy()
     c = df["close"]
 
@@ -76,8 +76,8 @@ def _add_features(df: pd.DataFrame) -> pd.DataFrame:
     # Day of week (0=Mon … 4=Fri)
     df["dow"] = pd.to_datetime(df["date"]).dt.dayofweek
 
-    # Target: did close go UP next day?
-    df["target"] = (c.shift(-1) > c).astype(int)
+    # Target: did close go UP N days from now?
+    df["target"] = (c.shift(-horizon) > c).astype(int)
 
     return df
 
@@ -92,23 +92,24 @@ FEATURE_COLS = [
 # Per-symbol model helpers
 # ---------------------------------------------------------------------------
 
-def _model_path(symbol: str) -> Path:
-    safe = symbol.replace("/", "_").replace("\\", "_")
-    return MODELS_DIR / f"{safe}.pkl"
+def _model_path(symbol: str, horizon: int = 1) -> Path:
+    safe   = symbol.replace("/", "_").replace("\\", "_")
+    suffix = f"_h{horizon}" if horizon != 1 else ""
+    return MODELS_DIR / f"{safe}{suffix}.pkl"
 
 
-def train(symbol: str) -> float | None:
+def train(symbol: str, horizon: int = 1) -> float | None:
     """
-    Train (or retrain) the model for *symbol*.
-    Returns test-set accuracy or None if there's not enough data.
+    Train (or retrain) the model for *symbol* at *horizon* days ahead.
+    Returns test-set accuracy or None if there is not enough data.
     """
     df = db.get_prices(symbol, limit=1000)
-    if len(df) < MIN_ROWS:
-        logger.debug("Not enough data for %s (%d rows).", symbol, len(df))
+    if len(df) < MIN_ROWS + horizon:
+        logger.debug("Not enough data for %s h=%d (%d rows).", symbol, horizon, len(df))
         return None
 
-    df = _add_features(df).dropna(subset=FEATURE_COLS + ["target"])
-    df = df.iloc[:-1]  # drop last row — target is unknown
+    df = _add_features(df, horizon).dropna(subset=FEATURE_COLS + ["target"])
+    df = df.iloc[:-horizon]  # last <horizon> rows have no known target yet
 
     if len(df) < MIN_ROWS:
         return None
@@ -133,20 +134,21 @@ def train(symbol: str) -> float | None:
     model.fit(X_train, y_train)
     accuracy = model.score(X_test, y_test)
 
-    joblib.dump(model, _model_path(symbol))
-    logger.info("Trained %s — test accuracy %.1f%%", symbol, accuracy * 100)
+    joblib.dump(model, _model_path(symbol, horizon))
+    logger.info("Trained %s h=%d — test accuracy %.1f%%", symbol, horizon, accuracy * 100)
     return accuracy
 
 
-def predict_next_day(symbol: str) -> dict | None:
+def predict_next_day(symbol: str, horizon: int = 1) -> dict | None:
     """
-    Predict next trading day's direction for *symbol*.
+    Predict the price direction *horizon* days from now for *symbol*.
     Returns {"direction": "UP"/"DOWN", "confidence": float, "predicted_close": float}
-    or None if prediction cannot be made.
+    or None if a prediction cannot be made.
+    Auto-trains the model for the given horizon if no model file exists yet.
     """
-    path = _model_path(symbol)
+    path = _model_path(symbol, horizon)
     if not path.exists():
-        acc = train(symbol)
+        acc = train(symbol, horizon)
         if acc is None:
             return None
 
@@ -156,7 +158,7 @@ def predict_next_day(symbol: str) -> dict | None:
     if len(df) < MIN_ROWS:
         return None
 
-    df = _add_features(df).dropna(subset=FEATURE_COLS)
+    df = _add_features(df, horizon).dropna(subset=FEATURE_COLS)
     last = df.iloc[-1]
 
     X = last[FEATURE_COLS].values.reshape(1, -1)
@@ -168,8 +170,8 @@ def predict_next_day(symbol: str) -> dict | None:
 
     avg_daily_move = df["close"].pct_change().abs().mean()
     predicted_close = (
-        last_close * (1 + avg_daily_move) if direction == "UP"
-        else last_close * (1 - avg_daily_move)
+        last_close * (1 + avg_daily_move * horizon) if direction == "UP"
+        else last_close * (1 - avg_daily_move * horizon)
     )
 
     return {
@@ -183,32 +185,34 @@ def predict_next_day(symbol: str) -> dict | None:
 # Batch operations
 # ---------------------------------------------------------------------------
 
-def train_all():
+def train_all(horizon: int = 1):
     """Train / retrain models for every security that has enough data."""
     securities = db.get_all_securities()
     total = len(securities)
     for idx, row in securities.iterrows():
         symbol = row["symbol"]
-        logger.info("[%d/%d] Training %s …", idx + 1, total, symbol)
-        train(symbol)
+        logger.info("[%d/%d] Training %s h=%d …", idx + 1, total, symbol, horizon)
+        train(symbol, horizon)
 
 
-def predict_all():
+def predict_all(horizon: int = 1):
     """
-    Run predictions for every security and save them to the DB for tomorrow.
+    Run predictions for every security and save them to the DB.
+    Predicts *horizon* calendar days from today.
     """
-    tomorrow = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-    securities = db.get_all_securities()
+    target_date = (datetime.today() + timedelta(days=horizon)).strftime("%Y-%m-%d")
+    securities  = db.get_all_securities()
     saved = 0
     for _, row in securities.iterrows():
         symbol = row["symbol"]
-        result = predict_next_day(symbol)
+        result = predict_next_day(symbol, horizon)
         if result:
             db.upsert_prediction(
-                symbol, tomorrow,
+                symbol, target_date,
                 result["direction"],
                 result["confidence"],
                 result["predicted_close"],
+                horizon,
             )
             saved += 1
     logger.info("Predictions saved for %d / %d securities.", saved, len(securities))

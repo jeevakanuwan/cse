@@ -8,7 +8,7 @@ import re
 import sys
 import base64
 import json as _json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -158,13 +158,18 @@ def load_securities():
 
 
 @st.cache_data(ttl=300)
-def load_predictions():
-    return db.get_latest_predictions()
+def load_predictions(horizon: int = 1):
+    return db.get_latest_predictions(horizon)
 
 
 @st.cache_data(ttl=60)
 def load_prices(symbol: str, days: int):
     return db.get_prices(symbol, limit=days)
+
+
+@st.cache_data(ttl=300)
+def load_prediction_history(horizon: int = 1):
+    return db.get_prediction_history(horizon=horizon)
 
 
 def direction_badge(direction: str) -> str:
@@ -296,11 +301,20 @@ def page_stock_analysis():
     st.plotly_chart(candlestick_chart(df, symbol), use_container_width=True)
     st.plotly_chart(moving_avg_chart(df, symbol),  use_container_width=True)
 
-    st.markdown("### Next-Day Prediction")
-    with st.spinner("Running prediction …"):
-        result = predictor.predict_next_day(symbol)
+    st.markdown("### Price Direction Forecast")
+    horizon = st.select_slider(
+        "Forecast horizon",
+        options=list(range(1, 8)),
+        value=1,
+        format_func=lambda n: f"{n} day ahead" if n == 1 else f"{n} days ahead",
+        key="analysis_horizon",
+    )
+    with st.spinner(f"Running {horizon}-day prediction …"):
+        result = predictor.predict_next_day(symbol, horizon)
 
     if result:
+        target_date = (datetime.today() + timedelta(days=horizon)).strftime("%Y-%m-%d")
+        st.caption(f"Forecast for **{target_date}** ({horizon}-day horizon)")
         p1, p2, p3 = st.columns(3)
         p1.metric("Direction",       direction_badge(result["direction"]))
         p2.metric("Confidence",      f"{result['confidence']*100:.1f}%")
@@ -314,37 +328,51 @@ def page_stock_analysis():
 
 def page_predictions():
     st.title("Predictions — All Securities")
-    preds = load_predictions()
 
-    if preds.empty:
-        st.warning("No predictions yet.")
-        if st.button("Run predictions for all securities now"):
-            with st.spinner("Running predictions …"):
-                predictor.predict_all()
-            st.success("Done! Refresh the page.")
-        return
+    # Horizon selector — shared across both tabs
+    horizon = st.select_slider(
+        "Forecast horizon",
+        options=list(range(1, 8)),
+        value=1,
+        format_func=lambda n: f"{n} day" if n == 1 else f"{n} days",
+    )
 
-    predicted_for = preds["predicted_for"].iloc[0]
-    st.caption(f"Predictions for: **{predicted_for}**")
+    tab_today, tab_history = st.tabs(["🔮 Predictions", "📊 Accuracy History"])
 
-    c1, c2, c3 = st.columns([1, 1, 2])
-    c1.metric("Predicted UP",   int((preds["direction"] == "UP").sum()))
-    c2.metric("Predicted DOWN", int((preds["direction"] == "DOWN").sum()))
-    search = c3.text_input("Search by symbol or company name", "")
+    with tab_today:
+        preds = load_predictions(horizon)
+        if preds.empty:
+            st.warning(f"No predictions for the {horizon}-day horizon yet.")
+            if st.button("Generate predictions now", key="gen_preds"):
+                with st.spinner(f"Running {horizon}-day predictions for all securities …"):
+                    predictor.predict_all(horizon)
+                st.success("Done! Refresh the page.")
+                st.cache_data.clear()
+        else:
+            predicted_for = preds["predicted_for"].iloc[0]
+            st.caption(f"Predicting price direction for: **{predicted_for}** ({horizon}-day horizon)")
 
-    if search:
-        mask = (
-            preds["symbol"].str.contains(search, case=False, na=False) |
-            preds["name"].str.contains(search, case=False, na=False)
-        )
-        preds = preds[mask]
+            c1, c2, c3 = st.columns([1, 1, 2])
+            c1.metric("Predicted UP",   int((preds["direction"] == "UP").sum()))
+            c2.metric("Predicted DOWN", int((preds["direction"] == "DOWN").sum()))
+            search = c3.text_input("Search by symbol or company name", "")
 
-    cols = ["symbol", "name", "sector", "direction", "confidence", "predicted_close"]
-    tab1, tab2 = st.tabs(["🟢 Predicted UP", "🔴 Predicted DOWN"])
-    with tab1:
-        _pred_table(preds[preds["direction"] == "UP"].sort_values("confidence", ascending=False)[cols])
-    with tab2:
-        _pred_table(preds[preds["direction"] == "DOWN"].sort_values("confidence", ascending=False)[cols])
+            if search:
+                mask = (
+                    preds["symbol"].str.contains(search, case=False, na=False) |
+                    preds["name"].str.contains(search, case=False, na=False)
+                )
+                preds = preds[mask]
+
+            cols = ["symbol", "name", "sector", "direction", "confidence", "predicted_close"]
+            sub1, sub2 = st.tabs(["🟢 Predicted UP", "🔴 Predicted DOWN"])
+            with sub1:
+                _pred_table(preds[preds["direction"] == "UP"].sort_values("confidence", ascending=False)[cols])
+            with sub2:
+                _pred_table(preds[preds["direction"] == "DOWN"].sort_values("confidence", ascending=False)[cols])
+
+    with tab_history:
+        _show_prediction_history(horizon)
 
 
 def _pred_table(df: pd.DataFrame):
@@ -355,6 +383,116 @@ def _pred_table(df: pd.DataFrame):
     display["confidence"] = display["confidence"].apply(lambda x: f"{x*100:.1f}%")
     display.columns = ["Symbol", "Name", "Sector", "Direction", "Confidence", "Predicted Close"]
     st.dataframe(display.reset_index(drop=True), use_container_width=True)
+
+
+def _show_prediction_history(horizon: int = 1):
+    hist = load_prediction_history(horizon)
+
+    if hist.empty:
+        st.info(
+            "No past predictions to evaluate yet. "
+            "History appears once the scheduler has run at least one full day cycle."
+        )
+        return
+
+    total      = len(hist)
+    accuracy   = hist["correct"].mean() * 100
+    up_hist    = hist[hist["predicted_direction"] == "UP"]
+    down_hist  = hist[hist["predicted_direction"] == "DOWN"]
+    up_acc     = up_hist["correct"].mean() * 100   if not up_hist.empty   else 0.0
+    down_acc   = down_hist["correct"].mean() * 100 if not down_hist.empty else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Predictions Evaluated", f"{total:,}")
+    c2.metric("Overall Accuracy",      f"{accuracy:.1f}%")
+    c3.metric("UP Accuracy",           f"{up_acc:.1f}%")
+    c4.metric("DOWN Accuracy",         f"{down_acc:.1f}%")
+
+    st.markdown("---")
+
+    # Monthly accuracy trend
+    monthly = (
+        hist.assign(month=hist["predicted_for"].str[:7])
+        .groupby("month")["correct"]
+        .agg(accuracy=lambda x: round(x.mean() * 100, 1), count="count")
+        .reset_index()
+    )
+    monthly = monthly[monthly["count"] >= 5]
+
+    if not monthly.empty:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=monthly["month"],
+            y=monthly["accuracy"],
+            mode="lines+markers",
+            name="Accuracy %",
+            line=dict(color="#26a69a", width=2),
+            marker=dict(size=7),
+            hovertemplate="%{x}: %{y:.1f}%<br>(%{customdata} predictions)<extra></extra>",
+            customdata=monthly["count"],
+        ))
+        fig.add_hline(y=50, line_dash="dash", line_color="#888",
+                      annotation_text="50% baseline", annotation_position="bottom right")
+        fig.update_layout(
+            title="Monthly Prediction Accuracy",
+            xaxis_title="Month",
+            yaxis_title="Accuracy (%)",
+            yaxis=dict(range=[0, 100]),
+            template="plotly_dark",
+            height=340,
+            margin=dict(l=40, r=40, t=50, b=40),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("#### Per-Symbol Accuracy")
+
+    sym_search = st.text_input("Search symbol or name", "", key="hist_sym_search")
+    by_sym = (
+        hist.groupby(["symbol", "name"])
+        .agg(
+            evaluated=("correct", "count"),
+            accuracy=("correct", lambda x: round(x.mean() * 100, 1)),
+            up_accuracy=("correct", lambda x: round(
+                x[hist.loc[x.index, "predicted_direction"] == "UP"].mean() * 100, 1
+            ) if (hist.loc[x.index, "predicted_direction"] == "UP").any() else float("nan")),
+            down_accuracy=("correct", lambda x: round(
+                x[hist.loc[x.index, "predicted_direction"] == "DOWN"].mean() * 100, 1
+            ) if (hist.loc[x.index, "predicted_direction"] == "DOWN").any() else float("nan")),
+            avg_confidence=("confidence", lambda x: round(x.mean() * 100, 1)),
+        )
+        .reset_index()
+        .sort_values("evaluated", ascending=False)
+    )
+
+    if sym_search:
+        mask = (
+            by_sym["symbol"].str.contains(sym_search, case=False, na=False) |
+            by_sym["name"].str.contains(sym_search, case=False, na=False)
+        )
+        by_sym = by_sym[mask]
+
+    by_sym_display = by_sym.copy()
+    by_sym_display.columns = [
+        "Symbol", "Name", "Evaluated", "Accuracy %",
+        "UP Accuracy %", "DOWN Accuracy %", "Avg Confidence %",
+    ]
+    st.dataframe(by_sym_display.reset_index(drop=True), use_container_width=True)
+
+    st.markdown("---")
+    with st.expander("Full prediction log"):
+        log = hist[["symbol", "name", "predicted_for", "predicted_direction",
+                    "actual_direction", "correct", "confidence",
+                    "predicted_close", "actual_close"]].copy()
+        log["confidence"]      = log["confidence"].apply(lambda x: f"{x*100:.1f}%")
+        log["correct"]         = log["correct"].apply(lambda x: "✅" if x else "❌")
+        log["predicted_close"] = log["predicted_close"].apply(lambda x: f"{x:.2f}")
+        log["actual_close"]    = log["actual_close"].apply(lambda x: f"{x:.2f}")
+        log.columns = [
+            "Symbol", "Name", "Date", "Predicted", "Actual",
+            "Result", "Confidence", "Predicted Close", "Actual Close",
+        ]
+        st.dataframe(log.reset_index(drop=True), use_container_width=True)
 
 
 def page_admin():
@@ -483,7 +621,6 @@ def page_setup():
             else:
                 for i, sec in enumerate(securities):
                     db.upsert_security(sec["symbol"], sec["name"], sec["sector"])
-                    from datetime import timedelta
                     to_date   = datetime.today().strftime("%Y-%m-%d")
                     from_date = (datetime.today() - timedelta(days=365 * years)).strftime("%Y-%m-%d")
                     records = scraper.fetch_history(sec["symbol"], from_date, to_date)
@@ -502,11 +639,18 @@ def page_setup():
 
     with col3:
         st.markdown("#### Retrain & predict")
+        retrain_horizon = st.select_slider(
+            "Horizon to retrain",
+            options=list(range(1, 8)),
+            value=1,
+            format_func=lambda n: f"{n} day" if n == 1 else f"{n} days",
+            key="setup_retrain_horizon",
+        )
         if st.button("🤖 Retrain all models + predict"):
-            with st.spinner("Training …"):
-                predictor.train_all()
-                predictor.predict_all()
-            st.success("All models retrained and predictions saved.")
+            with st.spinner(f"Training {retrain_horizon}-day models …"):
+                predictor.train_all(retrain_horizon)
+                predictor.predict_all(retrain_horizon)
+            st.success(f"All {retrain_horizon}-day models retrained and predictions saved.")
             st.cache_data.clear()
 
     st.markdown("---")

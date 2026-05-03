@@ -47,16 +47,23 @@ def init_db():
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol          TEXT NOT NULL,
                 predicted_for   TEXT NOT NULL,
+                horizon         INT  NOT NULL DEFAULT 1,
                 direction       TEXT,
                 confidence      REAL,
                 predicted_close REAL,
                 created_at      TEXT DEFAULT (datetime('now')),
-                UNIQUE(symbol, predicted_for)
+                UNIQUE(symbol, predicted_for, horizon)
             );
 
             CREATE INDEX IF NOT EXISTS idx_prices_symbol_date
                 ON daily_prices(symbol, date);
         """)
+        # Migration: add horizon column to existing DBs that predate this change
+        try:
+            conn.execute("ALTER TABLE predictions ADD COLUMN horizon INT NOT NULL DEFAULT 1")
+            conn.commit()
+        except Exception:
+            pass
 
 
 def upsert_security(symbol: str, name: str, sector: str):
@@ -89,17 +96,17 @@ def upsert_prices(records: list[dict]):
 
 
 def upsert_prediction(symbol: str, predicted_for: str, direction: str,
-                      confidence: float, predicted_close: float):
+                      confidence: float, predicted_close: float, horizon: int = 1):
     with get_connection() as conn:
         conn.execute("""
-            INSERT INTO predictions(symbol, predicted_for, direction, confidence, predicted_close)
-            VALUES(?, ?, ?, ?, ?)
-            ON CONFLICT(symbol, predicted_for) DO UPDATE SET
+            INSERT INTO predictions(symbol, predicted_for, horizon, direction, confidence, predicted_close)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, predicted_for, horizon) DO UPDATE SET
                 direction       = excluded.direction,
                 confidence      = excluded.confidence,
                 predicted_close = excluded.predicted_close,
                 created_at      = datetime('now')
-        """, (symbol, predicted_for, direction, confidence, predicted_close))
+        """, (symbol, predicted_for, horizon, direction, confidence, predicted_close))
 
 
 def get_all_securities() -> pd.DataFrame:
@@ -117,17 +124,78 @@ def get_prices(symbol: str, limit: int = 365) -> pd.DataFrame:
         """, conn, params=(symbol, limit))
 
 
-def get_latest_predictions() -> pd.DataFrame:
+def get_latest_predictions(horizon: int = 1) -> pd.DataFrame:
     with get_connection() as conn:
         return pd.read_sql("""
             SELECT p.*, s.name, s.sector
             FROM predictions p
             JOIN securities s ON s.symbol = p.symbol
-            WHERE p.predicted_for = (
-                SELECT MAX(predicted_for) FROM predictions
+            WHERE p.horizon = ?
+              AND p.predicted_for = (
+                SELECT MAX(predicted_for) FROM predictions WHERE horizon = ?
             )
             ORDER BY p.confidence DESC
-        """, conn)
+        """, conn, params=(horizon, horizon))
+
+
+def get_prediction_history(symbol: str = None, horizon: int = None,
+                           limit: int = 10000) -> pd.DataFrame:
+    """
+    Past predictions joined with actual outcomes.
+    Only includes rows where the predicted date has passed AND actual price
+    data for that date exists in daily_prices.
+
+    Returns columns:
+      symbol, name, predicted_for, horizon, predicted_direction, confidence,
+      predicted_close, actual_close, prev_close, actual_direction, correct (0/1)
+    """
+    with get_connection() as conn:
+        filters, params = [], []
+        if symbol:
+            filters.append("p.symbol = ?");  params.append(symbol)
+        if horizon is not None:
+            filters.append("p.horizon = ?"); params.append(horizon)
+        extra = ("AND " + " AND ".join(filters)) if filters else ""
+        params.append(limit)
+        return pd.read_sql(f"""
+            SELECT
+                p.symbol,
+                s.name,
+                p.predicted_for,
+                p.horizon,
+                p.direction            AS predicted_direction,
+                p.confidence,
+                p.predicted_close,
+                actual.close           AS actual_close,
+                prev_day.close         AS prev_close,
+                CASE
+                    WHEN actual.close >  prev_day.close THEN 'UP'
+                    WHEN actual.close <  prev_day.close THEN 'DOWN'
+                    ELSE 'FLAT'
+                END                    AS actual_direction,
+                CASE
+                    WHEN p.direction = 'UP'   AND actual.close >  prev_day.close THEN 1
+                    WHEN p.direction = 'DOWN' AND actual.close <= prev_day.close THEN 1
+                    ELSE 0
+                END                    AS correct
+            FROM predictions p
+            JOIN  securities s     ON s.symbol    = p.symbol
+            LEFT JOIN daily_prices actual
+                ON actual.symbol = p.symbol
+               AND actual.date   = p.predicted_for
+            LEFT JOIN daily_prices prev_day
+                ON prev_day.symbol = p.symbol
+               AND prev_day.date   = (
+                    SELECT MAX(date) FROM daily_prices
+                    WHERE  symbol = p.symbol AND date < p.predicted_for
+               )
+            WHERE p.predicted_for < date('now')
+              AND actual.close    IS NOT NULL
+              AND prev_day.close  IS NOT NULL
+              {extra}
+            ORDER BY p.predicted_for DESC
+            LIMIT ?
+        """, conn, params=tuple(params))
 
 
 def get_market_summary() -> pd.DataFrame:

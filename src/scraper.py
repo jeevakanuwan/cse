@@ -13,7 +13,7 @@ The server sets an accessToken cookie used by subsequent requests.
 
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -290,7 +290,7 @@ def fetch_history(symbol: str, from_date: str, to_date: str) -> list[dict]:
         ts_ms = item.get("tradeDate")
         if not ts_ms:
             continue
-        date = datetime.utcfromtimestamp(int(ts_ms) / 1000).strftime("%Y-%m-%d")
+        date = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
         records.append({
             "symbol": symbol,
