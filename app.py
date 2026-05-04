@@ -127,11 +127,12 @@ with st.sidebar:
             "Market Overview",
             "Stock Analysis",
             "Predictions",
+            "Predicted vs Actual",
             "Setup / Refresh",
             "Admin Panel",
         ]
     else:
-        page_options = ["Market Overview", "Predictions"]
+        page_options = ["Market Overview", "Predictions", "Predicted vs Actual"]
 
     page = st.radio("Navigate", page_options)
     st.markdown("---")
@@ -170,6 +171,11 @@ def load_prices(symbol: str, days: int):
 @st.cache_data(ttl=300)
 def load_prediction_history(horizon: int = 1):
     return db.get_prediction_history(horizon=horizon)
+
+
+@st.cache_data(ttl=300)
+def load_symbol_prediction_history(symbol: str, horizon: int = 1):
+    return db.get_prediction_history(symbol=symbol, horizon=horizon)
 
 
 def direction_badge(direction: str) -> str:
@@ -495,6 +501,147 @@ def _show_prediction_history(horizon: int = 1):
         st.dataframe(log.reset_index(drop=True), use_container_width=True)
 
 
+def page_prediction_vs_actual():
+    st.title("Predicted vs Actual — Close Price")
+
+    securities = load_securities()
+    if securities.empty:
+        st.warning("No securities loaded yet. Go to **Setup / Refresh** first.")
+        return
+
+    col_sel, col_hor = st.columns([3, 1])
+    with col_sel:
+        securities["label"] = securities["symbol"] + " — " + securities["name"]
+        label_to_symbol = dict(zip(securities["label"], securities["symbol"]))
+        selected_label = st.selectbox("Select listing", securities["label"].tolist(), key="pva_symbol")
+        symbol = label_to_symbol[selected_label]
+    with col_hor:
+        horizon = st.select_slider(
+            "Horizon",
+            options=list(range(1, 8)),
+            value=1,
+            format_func=lambda n: f"{n}d",
+            key="pva_horizon",
+        )
+
+    hist = load_symbol_prediction_history(symbol, horizon)
+
+    if hist.empty:
+        st.info(
+            "No past predictions found for this listing. "
+            "History appears once predictions have been made and the target date has passed."
+        )
+        return
+
+    hist = hist.sort_values("predicted_for")
+
+    # ── Summary metrics ──────────────────────────────────────────────────────
+    total     = len(hist)
+    dir_acc   = hist["correct"].mean() * 100
+    mae       = (hist["predicted_close"] - hist["actual_close"]).abs().mean()
+    mape      = ((hist["predicted_close"] - hist["actual_close"]).abs() / hist["actual_close"].replace(0, float("nan"))).mean() * 100
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Days Evaluated",       f"{total}")
+    c2.metric("Direction Accuracy",   f"{dir_acc:.1f}%")
+    c3.metric("Avg Price Error (MAE)", f"LKR {mae:.2f}")
+    c4.metric("Avg Price Error (MAPE)", f"{mape:.1f}%")
+
+    st.markdown("---")
+
+    # ── Predicted vs Actual close chart ──────────────────────────────────────
+    correct_mask   = hist["correct"] == 1
+    incorrect_mask = hist["correct"] == 0
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=hist["predicted_for"], y=hist["actual_close"],
+        mode="lines+markers",
+        name="Actual Close",
+        line=dict(color="#90caf9", width=2),
+        marker=dict(size=5),
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=hist["predicted_for"], y=hist["predicted_close"],
+        mode="lines+markers",
+        name="Predicted Close",
+        line=dict(color="#ffb74d", width=2, dash="dash"),
+        marker=dict(size=5),
+    ))
+
+    # Overlay correct/incorrect direction markers on the actual line
+    if correct_mask.any():
+        fig.add_trace(go.Scatter(
+            x=hist.loc[correct_mask, "predicted_for"],
+            y=hist.loc[correct_mask, "actual_close"],
+            mode="markers",
+            name="Direction Correct ✅",
+            marker=dict(color="#26a69a", size=9, symbol="circle"),
+            hovertemplate="%{x}<br>Actual: %{y:.2f}<br>Direction: correct<extra></extra>",
+        ))
+
+    if incorrect_mask.any():
+        fig.add_trace(go.Scatter(
+            x=hist.loc[incorrect_mask, "predicted_for"],
+            y=hist.loc[incorrect_mask, "actual_close"],
+            mode="markers",
+            name="Direction Wrong ❌",
+            marker=dict(color="#ef5350", size=9, symbol="x"),
+            hovertemplate="%{x}<br>Actual: %{y:.2f}<br>Direction: wrong<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=f"{symbol} — Predicted vs Actual Close ({horizon}-day horizon)",
+        xaxis_title="Date",
+        yaxis_title="Price (LKR)",
+        template="plotly_dark",
+        height=440,
+        margin=dict(l=40, r=40, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Price error over time ─────────────────────────────────────────────────
+    hist_err = hist.copy()
+    hist_err["price_error"] = hist_err["predicted_close"] - hist_err["actual_close"]
+
+    fig2 = go.Figure()
+    fig2.add_trace(go.Bar(
+        x=hist_err["predicted_for"],
+        y=hist_err["price_error"],
+        name="Prediction Error",
+        marker_color=[
+            "#26a69a" if e >= 0 else "#ef5350" for e in hist_err["price_error"]
+        ],
+        hovertemplate="%{x}<br>Error: %{y:+.2f} LKR<extra></extra>",
+    ))
+    fig2.add_hline(y=0, line_dash="dot", line_color="#888")
+    fig2.update_layout(
+        title="Daily Price Prediction Error (Predicted − Actual)",
+        xaxis_title="Date",
+        yaxis_title="Error (LKR)",
+        template="plotly_dark",
+        height=280,
+        margin=dict(l=40, r=40, t=50, b=40),
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Raw data table ────────────────────────────────────────────────────────
+    with st.expander("Raw data"):
+        log = hist[["predicted_for", "predicted_direction", "actual_direction",
+                    "correct", "confidence", "predicted_close", "actual_close"]].copy()
+        log["confidence"]      = log["confidence"].apply(lambda x: f"{x*100:.1f}%")
+        log["correct"]         = log["correct"].apply(lambda x: "✅" if x else "❌")
+        log["predicted_close"] = log["predicted_close"].apply(lambda x: f"{x:.2f}")
+        log["actual_close"]    = log["actual_close"].apply(lambda x: f"{x:.2f}")
+        log = log.sort_values("predicted_for", ascending=False)
+        log.columns = ["Date", "Predicted Dir", "Actual Dir", "Result",
+                       "Confidence", "Predicted Close", "Actual Close"]
+        st.dataframe(log.reset_index(drop=True), use_container_width=True)
+
+
 def page_admin():
     st.title("Admin Panel — User Management")
 
@@ -677,6 +824,8 @@ elif page == "Stock Analysis":
     page_stock_analysis()
 elif page == "Predictions":
     page_predictions()
+elif page == "Predicted vs Actual":
+    page_prediction_vs_actual()
 elif page == "Setup / Refresh":
     page_setup()
 elif page == "Admin Panel":

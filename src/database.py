@@ -65,6 +65,39 @@ def init_db():
         except Exception:
             pass
 
+        # Migration: rebuild predictions table so UNIQUE constraint includes horizon
+        try:
+            import re as _re
+            cur = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='predictions'"
+            )
+            row = cur.fetchone()
+            if row:
+                m = _re.search(r'UNIQUE\s*\(([^)]+)\)', row[0], _re.IGNORECASE)
+                if m and 'horizon' not in m.group(1):
+                    conn.executescript("""
+                        CREATE TABLE predictions_new (
+                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                            symbol          TEXT NOT NULL,
+                            predicted_for   TEXT NOT NULL,
+                            horizon         INT  NOT NULL DEFAULT 1,
+                            direction       TEXT,
+                            confidence      REAL,
+                            predicted_close REAL,
+                            created_at      TEXT DEFAULT (datetime('now')),
+                            UNIQUE(symbol, predicted_for, horizon)
+                        );
+                        INSERT OR IGNORE INTO predictions_new
+                            (id, symbol, predicted_for, horizon, direction, confidence, predicted_close, created_at)
+                        SELECT id, symbol, predicted_for, COALESCE(horizon, 1),
+                               direction, confidence, predicted_close, created_at
+                        FROM predictions;
+                        DROP TABLE predictions;
+                        ALTER TABLE predictions_new RENAME TO predictions;
+                    """)
+        except Exception:
+            pass
+
 
 def upsert_security(symbol: str, name: str, sector: str):
     with get_connection() as conn:
